@@ -1,15 +1,19 @@
 #include <iostream>
 #include <vector>
 #include <memory>
-#include <chrono>   
+#include <chrono>
+#include <dirent.h>
 
-#include <assert.h>
+#include <fstream>
+
+#include <sys/stat.h>
 
 #include <opencv2/core/mat.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv2/highgui/highgui.hpp>
 
 #include <cuda_runtime_api.h>
+#include <fstream>
 
 #include "NvCaffeParser.h"
 
@@ -22,6 +26,148 @@ float data1[8] = { -56,-56,71,71,-24,-24,39,39 };
 float data2[8] = { -8,-8,23,23,0,0,15,15 };
 
 float resize_scale = 1;
+
+static std::vector<float> cvMatToCHW(cv::Mat &img,
+                              int destChannel,
+                              int destHeight,
+                              int destWidth);
+
+static const std::vector<std::string> getImages(const std::string &imagePath){
+    std::vector<std::string> ret;
+    DIR *p_dir;
+    struct dirent *p_dirent;
+
+    if((p_dir = opendir((imagePath).c_str())) == NULL){
+        std::cout << "check pir path:" << (imagePath).c_str() << " failed" << std::endl;
+        return ret;
+    }
+
+    while((p_dirent=readdir(p_dir)))
+    {
+        struct stat s_buf;
+
+        if ( !strcmp(p_dirent->d_name, ".") || !strcmp(p_dirent->d_name, "..") ) {
+            continue;
+        }
+
+        /*获取文件信息，把信息放到s_buf中*/
+        stat((imagePath + "/" + std::string(p_dirent->d_name)).c_str(), &s_buf);
+
+        if ( s_buf.st_mode & S_IFDIR ){
+            std::string s(p_dirent->d_name);
+
+                auto files = getImages(imagePath + "/" + s);
+                ret.insert(ret.end(), files.begin(), files.end());
+
+        } else{
+            std::string s(p_dirent->d_name);
+                ret.push_back(imagePath + "/" + s);
+        }
+    }
+    closedir(p_dir);
+
+    return ret;
+}
+
+class Int8EntropyCalibrator : public IInt8EntropyCalibrator
+{
+public:
+    Int8EntropyCalibrator(const std::string &imagePath, const int n, const int c, const int h, const int w){
+        imagePaths = getImages(imagePath);
+
+        this->n = n;
+        this->c = c;
+        this->h = h;
+        this->w = w;
+
+        cudaMalloc(&gpuMemory, n*c*h*w*4);
+    }
+
+    ~Int8EntropyCalibrator(){
+        cudaFree(gpuMemory);
+    }
+
+    int getBatchSize() const override{
+        return 1;
+    }
+
+    bool getBatch(void *bindings[], const char *names[], int nbBindings) override {
+        if ( imageIndex >= imagePaths.size() ) {
+            printf("### index = %d\n", imageIndex);
+            return false;
+        }
+
+        cv::Mat img = cv::imread(imagePaths[imageIndex]);
+
+        input = cvMatToCHW(img, c, h, w);
+
+        cudaMemcpy(gpuMemory, input.data(), n*c*h*w*4, cudaMemcpyHostToDevice);
+
+        bindings[0] = gpuMemory;
+
+        printf("### index = %d\n", imageIndex);
+
+        imageIndex++;
+
+        return true;
+    }
+
+
+    const void* readCalibrationCache(size_t& length) override {
+        std::ifstream cacheFile("/home/ubuntu/int8Calibration.cache", std::ios::in | std::ios::binary);
+
+        if ( cacheFile.is_open() ){
+            cacheFile.seekg(0, std::ios::end);
+            int size = cacheFile.tellg();
+
+            cacheFile.seekg (0, std::ios::beg);
+
+            cache.reserve(size);
+
+            cacheFile.read((char*)cache.data(), size);
+
+            cacheFile.close();
+
+            length = size;
+            return cache.data();
+        }
+
+        cacheFile.close();
+
+        return nullptr;
+    }
+
+    void writeCalibrationCache(const void* cache, size_t length) override {
+
+        printf("############### writeCalibrationCache\n");
+
+
+        std::ofstream cacheFile("/home/ubuntu/int8Calibration.cache", std::ios::out | std::ios::binary | std::ios::trunc);
+
+        cacheFile.write((char*)cache, length);
+
+        cacheFile.close();
+    }
+
+private:
+
+    std::vector<std::string> imagePaths;
+    int imageIndex{0};
+    int n, c, h, w;
+
+    std::string cache;
+
+    std::vector<float> input;
+
+    void *gpuMemory{nullptr};
+
+    const std::vector<std::string> imageSuffixs{
+        ".jpg",
+        ".jpeg",
+        ".png"
+    };
+
+};
 
 class Anchor {
 public:
@@ -269,10 +415,10 @@ static std::vector<float> cvMatToCHW(cv::Mat &img,
     if ( scaleX != scaleY ){
 		if (scaleX > scaleY)
 		{
-			printf("scaleX %f scaleY %f\n", scaleX, scaleY);
+			//printf("scaleX %f scaleY %f\n", scaleX, scaleY);
             resize_scale = scaleY;
 			int fillSize = destWidth/scaleY - img.cols;
-			printf("fillSize %d\n", fillSize);
+			//printf("fillSize %d\n", fillSize);
 			cv::copyMakeBorder(img, destImg, 0, 0, 0, fillSize, cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
 		}else
 		{
@@ -293,14 +439,14 @@ static std::vector<float> cvMatToCHW(cv::Mat &img,
 
     //HWC TO CHW
     std::vector<cv::Mat> input_channels(destImg.channels());
-    printf("### destImg.channels() = %d\n", destImg.channels());
+    //printf("### destImg.channels() = %d\n", destImg.channels());
     cv::split(destImg, input_channels);
 
     std::vector<float> result(destChannel * destHeight * destWidth);
     auto data = result.data();
     int channelLength = destHeight * destWidth;
     for (int i = 0; i < destChannel; ++i) {
-        printf("### input_channels[i] = %d\n", input_channels[i].cols);
+        //printf("### input_channels[i] = %d\n", input_channels[i].cols);
         memcpy(data,input_channels[i].data,channelLength*sizeof(float));
         data += channelLength;
     }
@@ -321,12 +467,16 @@ static int getDimsSize(Dims dim, int elementByteSize){
 
 Logger gLogger;
 
-const std::string deployFile = "models/mnet.prototxt";
-const std::string modelFile = "models/mnet.caffemodel";
+const std::string deployFile = "../models/mnet.prototxt";
+const std::string modelFile = "../models/mnet.caffemodel";
+
+
 
 std::vector<float> input;
 
 int main(){
+    std::unique_ptr<Int8EntropyCalibrator> int8EntropyCalibrator(new Int8EntropyCalibrator("/home/ubuntu/czx/WIDER_val", 1, 3, 2160, 3840));
+
 	ac[0].Init(32, 2, data0);
 	ac[1].Init(16, 2, data1);
 	ac[2].Init(8, 2, data2);
@@ -365,6 +515,8 @@ int main(){
     // Build the engine
 	builder->setMaxBatchSize(1);
 	builder->setMaxWorkspaceSize(1 << 20);
+	builder->setInt8Calibrator(int8EntropyCalibrator.get());
+	builder->setInt8Mode(true);
 
     ICudaEngine* engine = builder->buildCudaEngine(*network);
 	
@@ -406,7 +558,7 @@ int main(){
     cv::Mat img = cv::imread("../test.jpg");
 	cv::cvtColor(img, img, CV_BGR2RGB);
 
-    input = cvMatToCHW(img, 3, 720, 1080);
+    input = cvMatToCHW(img, 3, 2160, 3840);
 
 	std::cout << "input size" << input.size() << std::endl;
 	std::cout << "input size1 " << getDimsSize(engine->getBindingDimensions(0), sizeof(float)) << std::endl;
@@ -416,7 +568,7 @@ int main(){
             getDimsSize(engine->getBindingDimensions(0), sizeof(float)), 
             cudaMemcpyHostToDevice, nullptr);
 
-    for (size_t i = 0; i < 1; i++)
+    for (size_t i = 0; i < 20; i++)
     {
         auto start = std::chrono::system_clock::now();
         context->execute(1, buffers);
@@ -487,7 +639,7 @@ int main(){
 
 	// printf("##### 4\n");
 
-	cv::imwrite("result.png", img1);
+	cv::imwrite("/home/ubuntu/czx/result333.png", img1);
 
 	// printf("##### 5\n");
 }
